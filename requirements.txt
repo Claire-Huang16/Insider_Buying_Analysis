@@ -5,3 +5,4 @@ plotly
 openai
 numpy
 beautifulsoup4
+lxml

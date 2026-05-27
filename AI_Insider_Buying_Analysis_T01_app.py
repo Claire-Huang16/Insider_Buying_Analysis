@@ -600,6 +600,35 @@ with st.sidebar:
         ).strip()
         st.caption("ℹ️ 輸入台灣證券交易所股票代號，例如: 2330（台積電）")
         cik_input = ""  # 台股不使用 CIK
+
+        st.markdown("")
+        st.markdown("**📅 董監事持股異動年度**")
+        current_roc = datetime.now().year - 1911
+        year_options = list(range(current_roc, current_roc - 6, -1))
+        chosen_roc = st.selectbox(
+            "查詢民國年度",
+            options=year_options,
+            format_func=lambda y: f"民國 {y} 年（{y+1911}）",
+            label_visibility="collapsed"
+        )
+
+        st.markdown("**📅 股東持股分級起始年**")
+        start_year2 = st.selectbox(
+            "股東持股分級起始年份",
+            options=[str(y) for y in range(2020, datetime.now().year + 1)],
+            index=0,
+            label_visibility="collapsed",
+            key="chip_year"
+        )
+
+        st.markdown("**📅 三大法人買賣起始年**")
+        start_year3 = st.selectbox(
+            "三大法人起始年份",
+            options=[str(y) for y in range(2022, datetime.now().year + 1)],
+            index=0,
+            label_visibility="collapsed",
+            key="inst_year"
+        )
     else:
         st.markdown("**🏢 公司代碼** *")
         symbol_input = st.text_input(
@@ -751,17 +780,6 @@ if is_tw_market:
         st.subheader(f"📋 {symbol_input} 董監事持股異動申報")
         st.caption("資料來源：公開資訊觀測站（MOPS）— 董監事持股異動申報表（t51sb06）")
 
-        col_y1, col_y2 = st.columns(2)
-        with col_y1:
-            current_roc = datetime.now().year - 1911
-            year_options = list(range(current_roc, current_roc - 6, -1))
-            chosen_roc = st.selectbox("查詢民國年度", options=year_options,
-                                      format_func=lambda y: f"民國 {y} 年（{y+1911}）")
-        with col_y2:
-            st.markdown("")
-            st.markdown("")
-            st.caption(f"💡 MOPS 依年度申報，每次查一個年度")
-
         with st.spinner(f"正在從公開資訊觀測站取得 {symbol_input} 民國 {chosen_roc} 年資料..."):
             df_mops, mops_err = get_mops_insider_changes(symbol_input, year_roc=chosen_roc)
 
@@ -786,8 +804,6 @@ if is_tw_market:
     with tab_tw2:
         st.subheader(f"📊 {symbol_input} 股東持股分級（籌碼集中度）")
         st.caption("資料來源：FinMind API — TaiwanStockHoldingSharesPer（需 Backer 付費等級）")
-
-        start_year2 = st.selectbox("查詢起始年份", options=[str(y) for y in range(2020, datetime.now().year + 1)], index=0, key="chip_year")
 
         with st.spinner(f"正在從 FinMind 取得 {symbol_input} 股東持股分級..."):
             df_holding, holding_err = get_finmind_holding_shares_per(symbol_input, finmind_api_key, start_date=f"{start_year2}-01-01")
@@ -827,8 +843,6 @@ if is_tw_market:
     with tab_tw3:
         st.subheader(f"🏦 {symbol_input} 三大法人買賣超")
         st.caption("資料來源：FinMind API — TaiwanStockInstitutionalInvestorsBuySell")
-
-        start_year3 = st.selectbox("查詢起始年份", options=[str(y) for y in range(2022, datetime.now().year + 1)], index=0, key="inst_year")
 
         with st.spinner(f"正在從 FinMind 取得 {symbol_input} 三大法人資料..."):
             df_inst, inst_err = get_finmind_institutional_investors(symbol_input, finmind_api_key, start_date=f"{start_year3}-01-01")

@@ -99,7 +99,103 @@ def get_insider_trading_by_cik(cik, api_key):
         st.error(f"獲取內部人交易資料失敗: {str(e)}")
         return []
 
-# ==================== 台股 API 函數（台灣證交所公開資料）====================
+# ==================== FinMind API 函數（台股，Backer 付費等級）====================
+
+FINMIND_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
+
+@st.cache_data(ttl=1800)
+def get_finmind_insider_trading(stock_code, finmind_token, start_date="2020-01-01"):
+    """
+    透過 FinMind API 取得台股董監事持股異動申報
+    dataset: TaiwanStockInsiderTrading（需 Backer 付費等級）
+    """
+    params = {
+        "dataset": "TaiwanStockInsiderTrading",
+        "data_id": stock_code,
+        "start_date": start_date,
+        "token": finmind_token,
+    }
+    try:
+        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") != 200:
+            msg = result.get("msg", "未知錯誤")
+            return pd.DataFrame(), f"FinMind API 回傳錯誤：{msg}"
+        data = result.get("data", [])
+        if not data:
+            return pd.DataFrame(), None
+        df = pd.DataFrame(data)
+        return df, None
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "請求逾時，請稍後再試"
+    except requests.exceptions.HTTPError as e:
+        return pd.DataFrame(), f"HTTP 錯誤：{e}"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=1800)
+def get_finmind_stock_price(stock_code, finmind_token):
+    """取得台股最新股價（TaiwanStockPrice，近 5 日）"""
+    from datetime import timedelta
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_code,
+        "start_date": start,
+        "end_date": end,
+        "token": finmind_token,
+    }
+    try:
+        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=15)
+        result = resp.json()
+        if result.get("status") != 200:
+            return None
+        data = result.get("data", [])
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        if "close" in df.columns:
+            return float(df["close"].iloc[-1])
+        return None
+    except Exception:
+        return None
+
+
+def process_finmind_insider_df(df):
+    """
+    整理 FinMind TaiwanStockInsiderTrading DataFrame，
+    統一欄位名稱為中文，方便顯示。
+    """
+    if df.empty:
+        return df
+    col_map = {
+        "date": "申報日期",
+        "stock_id": "股票代號",
+        "name": "內部人姓名",
+        "title": "職位",
+        "change_type": "異動類型",
+        "change_shares": "異動股數",
+        "holding_shares": "持有股數",
+        "holding_ratio": "持股比例(%)",
+        "pledge_shares": "質押股數",
+        "pledge_ratio": "質押比例(%)",
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+    # 格式化數字欄位
+    for col in ["異動股數", "持有股數", "質押股數"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).apply(lambda x: f"{x:,}")
+    for col in ["持股比例(%)", "質押比例(%)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+    if "申報日期" in df.columns:
+        df = df.sort_values("申報日期", ascending=False)
+    return df.reset_index(drop=True)
+
+
 
 # ==================== 台股資料來源：Goodinfo.tw ====================
 # 關鍵發現：goodinfo StockList 的資料藏在 <div id="txtStockListData"> 內
@@ -372,24 +468,31 @@ with st.sidebar:
     st.subheader("🌏 市場選擇")
     market_choice = st.radio(
         "選擇分析市場",
-        options=["🇺🇸 美股（SEC Form 4）", "🇹🇼 台股（TWSE 申報）"],
+        options=["🇹🇼 台股（FinMind 申報）", "🇺🇸 美股（SEC Form 4）"],
         index=0,
-        help="美股：查詢 SEC Form 4 內部人申報；台股：查詢台灣證交所董監事持股異動"
+        help="台股：透過 FinMind API 查詢董監事持股異動；美股：查詢 SEC Form 4 內部人申報"
     )
-    is_tw_market = market_choice.startswith("🇹🇼")
+    is_tw_market = "台股" in market_choice
 
     st.markdown("---")
 
-    # ── API 金鑰（僅美股需要）──
-    if not is_tw_market:
+    # ── API 金鑰 ──
+    if is_tw_market:
+        st.subheader("🔑 API 金鑰")
+        finmind_api_key = st.text_input(
+            "FinMind API Key *",
+            type="password",
+            help="用於獲取台股董監事持股異動資料（FinMind Backer 付費等級）"
+        )
+        fmp_api_key = ""
+    else:
         st.subheader("🔑 API 金鑰")
         fmp_api_key = st.text_input(
             "FMP API Key *",
             type="password",
             help="用於獲取美股內部人交易資料（Financial Modeling Prep）"
         )
-    else:
-        fmp_api_key = ""  # 台股不需要 API Key
+        finmind_api_key = ""
 
     st.markdown("---")
 
@@ -439,13 +542,14 @@ with st.sidebar:
         st.markdown("""
 **基本使用**：
 1. 選擇「台股」市場
-2. 輸入台股代號（必填）
-3. 點擊「執行分析」
-4. 查看「董監事持股異動」頁籤
+2. 輸入 FinMind API Key（必填）
+3. 輸入台股代號（必填）
+4. 點擊「執行分析」
+5. 查看「董監事持股異動」頁籤
 
 **資料來源**：
-- 台灣證券交易所公開資訊
-- 無需 API 金鑰
+- FinMind API（Backer 付費等級）
+- 台股董監事持股異動申報
         """)
     else:
         st.markdown("""
@@ -490,11 +594,10 @@ if not run_button:
 - 20 種交易類型完整說明與價值評級
 - 提供 SEC 官方文件連結
 
-### 🇹🇼 台股（TWSE 公開申報）
-- 查詢台灣上市公司董監事持股異動申報
-- 資料來源：台灣證券交易所公開資訊
-- 無需 API 金鑰，直接查詢
-- 台股特有申報類型說明
+### 🇹🇼 台股（FinMind API）
+- 透過 FinMind Backer 付費 API 查詢董監事持股異動申報
+- 支援按異動類型篩選與歷年統計分析
+- 需要 FinMind API Key（Backer 付費等級）
 
 ### 📋 共同功能
 - 完整交易明細顯示
@@ -510,19 +613,32 @@ if not symbol_input:
 
 # ==================== 台股分析流程 ====================
 if is_tw_market:
-    # 公司基本資訊（twstock 本地 + goodinfo 股價）
+    # ── 台股入口驗證 ──
+    if not finmind_api_key:
+        st.info("👈 請在左側輸入 FinMind API Key 開始使用")
+        st.markdown("""
+> **如何取得 FinMind API Key？**
+> 1. 前往 [FinMind](https://finmindtrade.com/) 註冊帳號
+> 2. 升級至 **Backer** 付費等級（可解鎖 TaiwanStockInsiderTrading 資料集）
+> 3. 至帳號設定頁面複製 Token，貼入左側輸入框
+        """)
+        st.stop()
+
+    # 公司基本資訊（twstock 本地）
     with st.spinner(f"正在取得 {symbol_input} 公司資訊..."):
         tw_profile = get_tw_company_profile(symbol_input)
+        price_val = get_finmind_stock_price(symbol_input, finmind_api_key)
+        if price_val:
+            tw_profile["price"] = price_val
 
-    # 公司資訊標題列
     company_title = tw_profile.get("companyName", symbol_input)
     industry_txt  = tw_profile.get("industry", "")
     market_txt    = tw_profile.get("market", "台股")
     st.subheader(f"🇹🇼 {symbol_input} - {company_title}")
     col1, col2, col3 = st.columns(3)
     with col1:
-        price_val = tw_profile.get("price")
-        st.metric("最新股價", f"NT${price_val:,.1f}" if price_val else "—")
+        pv = tw_profile.get("price")
+        st.metric("最新股價", f"NT${pv:,.1f}" if pv else "—")
     with col2:
         st.metric("產業", industry_txt or "—")
     with col3:
@@ -532,66 +648,96 @@ if is_tw_market:
 
     # 台股頁籤
     tab_tw1, tab_tw2, tab_tw3 = st.tabs([
-        "📋 個股董監持股",
-        "🏆 全體董監持股排行",
+        "📋 董監事持股異動",
+        "📊 異動統計分析",
         "📚 台股申報說明"
     ])
 
-    # ── 頁籤1：個股董監持股（goodinfo BasicInfo）──
+    # ── 頁籤1：董監事持股異動（FinMind）──
     with tab_tw1:
-        st.subheader(f"📋 {symbol_input} 董監事持股資料")
-        st.caption("資料來源：Goodinfo.tw（取自台股公開申報）")
+        st.subheader(f"📋 {symbol_input} 董監事持股異動申報")
+        st.caption("資料來源：FinMind API — TaiwanStockInsiderTrading（Backer 付費等級）")
 
-        with st.spinner("正在從 Goodinfo.tw 取得個股董監持股資料..."):
-            df_holdings, holdings_err = get_tw_insider_holdings(symbol_input)
+        # 日期範圍選擇
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            start_year = st.selectbox("查詢起始年份", options=[str(y) for y in range(2020, datetime.now().year + 1)], index=0)
+        start_date_str = f"{start_year}-01-01"
 
-        if holdings_err:
-            st.error(f"❌ 取得資料失敗：{holdings_err}")
-            st.info("📎 可直接至 [Goodinfo 個股頁](https://goodinfo.tw/tw/BasicInfo.asp?STOCK_ID=" + symbol_input + ") 查看")
-        elif df_holdings.empty:
-            st.warning(f"⚠️ 未取得 {symbol_input} 的董監持股資料")
-            st.info(
-                "📌 可能原因：\n"
-                "1. 股票代號輸入有誤（請輸入數字，例如台積電 **2330**）\n"
-                "2. Goodinfo 頁面結構異動，請至網站直接查閱\n\n"
-                f"📎 [點此至 Goodinfo 查詢 {symbol_input}](https://goodinfo.tw/tw/BasicInfo.asp?STOCK_ID={symbol_input})"
-            )
+        with st.spinner(f"正在從 FinMind 取得 {symbol_input} 董監事持股異動資料..."):
+            df_insider_raw, insider_err = get_finmind_insider_trading(symbol_input, finmind_api_key, start_date=start_date_str)
+
+        if insider_err:
+            st.error(f"❌ 取得資料失敗：{insider_err}")
+            st.info("請確認：\n1. FinMind API Key 是否正確\n2. 帳號是否為 Backer 付費等級\n3. 股票代號是否正確（例如台積電：**2330**）")
+        elif df_insider_raw.empty:
+            st.warning(f"⚠️ {symbol_input} 在 {start_year} 年後無董監事持股異動申報記錄")
         else:
-            st.info(f"共 {len(df_holdings)} 筆董監持股資料")
-            st.dataframe(df_holdings, use_container_width=True, height=450, hide_index=True)
+            df_display = process_finmind_insider_df(df_insider_raw.copy())
+            st.info(f"共 {len(df_display)} 筆異動申報記錄（{start_year} 年起）")
+
+            # 篩選異動類型
+            if "異動類型" in df_display.columns:
+                all_types = ["全部"] + sorted(df_display["異動類型"].dropna().unique().tolist())
+                chosen_type = st.selectbox("篩選異動類型", options=all_types)
+                if chosen_type != "全部":
+                    df_display = df_display[df_display["異動類型"] == chosen_type]
+
+            st.dataframe(df_display, use_container_width=True, height=500, hide_index=True)
             st.markdown("---")
-            csv1 = df_holdings.to_csv(index=False).encode("utf-8-sig")
+            csv1 = df_display.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下載個股董監持股 CSV", csv1,
-                file_name=f"tw_holdings_{symbol_input}_{datetime.now().strftime('%Y%m%d')}.csv",
+                "📥 下載董監事持股異動 CSV", csv1,
+                file_name=f"tw_insider_{symbol_input}_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
-            st.markdown(f"🔗 [在 Goodinfo.tw 查看完整資料](https://goodinfo.tw/tw/BasicInfo.asp?STOCK_ID={symbol_input})")
 
-    # ── 頁籤2：全體董監持股排行（goodinfo StockList）──
+    # ── 頁籤2：統計分析 ──
     with tab_tw2:
-        st.subheader("🏆 全體上市公司董監持股比例排行")
-        st.caption("資料來源：Goodinfo.tw 熱門排行 → 全體董監持股比例（最新資料，前300名）")
+        st.subheader(f"📊 {symbol_input} 異動統計分析")
 
-        with st.spinner("正在從 Goodinfo.tw 載入董監持股排行榜，約需 5–10 秒..."):
-            df_rank, rank_err = get_tw_insider_ranking(rank_range=300)
+        with st.spinner("正在載入統計資料..."):
+            df_stat_raw, stat_err = get_finmind_insider_trading(symbol_input, finmind_api_key, start_date="2020-01-01")
 
-        if rank_err:
-            st.error(f"❌ 取得排行失敗：{rank_err}")
-            st.info("📎 可直接至 [Goodinfo 董監持股排行](https://goodinfo.tw/tw/StockList.asp?MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E5%85%A8%E9%AB%94%E8%91%A3%E7%9B%A3%E6%8C%81%E8%82%A1%E6%AF%94%E4%BE%8B%28%25%29%40%40%E5%85%A8%E9%AB%94%E8%91%A3%E7%9B%A3%40%40%E6%8C%81%E8%82%A1%E6%AF%94%E4%BE%8B%28%25%29&SHEET=%E8%91%A3%E7%9B%A3%E6%8C%81%E8%82%A1&RPT_TIME=%E6%9C%80%E6%96%B0%E8%B3%87%E6%96%99&RANK_RANGE=300) 查看")
-        elif df_rank.empty:
-            st.warning("⚠️ 排行榜資料為空")
+        if stat_err or df_stat_raw.empty:
+            st.warning("⚠️ 無法取得統計資料，請先確認頁籤一資料正常")
         else:
-            st.info(f"共 {len(df_rank)} 筆排行資料（依董監持股比例排序）")
-            st.dataframe(df_rank, use_container_width=True, height=500, hide_index=True)
+            df_stat = process_finmind_insider_df(df_stat_raw.copy())
+
+            # 統計卡片
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("總申報筆數", f"{len(df_stat)} 筆")
+            with col2:
+                if "異動類型" in df_stat.columns:
+                    buy_cnt = df_stat["異動類型"].str.contains("買|增|認購", na=False).sum()
+                    st.metric("買進/增持", f"{buy_cnt} 筆")
+            with col3:
+                if "異動類型" in df_stat.columns:
+                    sell_cnt = df_stat["異動類型"].str.contains("賣|減|轉讓", na=False).sum()
+                    st.metric("賣出/減持", f"{sell_cnt} 筆")
+            with col4:
+                if "內部人姓名" in df_stat.columns:
+                    unique_persons = df_stat["內部人姓名"].nunique()
+                    st.metric("申報人數", f"{unique_persons} 人")
+
             st.markdown("---")
-            csv2 = df_rank.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "📥 下載董監持股排行 CSV", csv2,
-                file_name=f"tw_insider_rank_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-            st.markdown("🔗 [在 Goodinfo.tw 查看完整排行](https://goodinfo.tw/tw/StockList.asp?MARKET_CAT=%E7%86%B1%E9%96%80%E6%8E%92%E8%A1%8C&INDUSTRY_CAT=%E5%85%A8%E9%AB%94%E8%91%A3%E7%9B%A3%E6%8C%81%E8%82%A1%E6%AF%94%E4%BE%8B%28%25%29%40%40%E5%85%A8%E9%AB%94%E8%91%A3%E7%9B%A3%40%40%E6%8C%81%E8%82%A1%E6%AF%94%E4%BE%8B%28%25%29&SHEET=%E8%91%A3%E7%9B%A3%E6%8C%81%E8%82%A1&RPT_TIME=%E6%9C%80%E6%96%B0%E8%B3%87%E6%96%99&RANK_RANGE=300)")
+
+            # 按人別彙整
+            if "內部人姓名" in df_stat.columns and "異動類型" in df_stat.columns:
+                st.subheader("👥 各董監事申報次數彙整")
+                person_summary = df_stat.groupby(["內部人姓名", "職位"] if "職位" in df_stat.columns else ["內部人姓名"]).size().reset_index(name="申報次數")
+                person_summary = person_summary.sort_values("申報次數", ascending=False)
+                st.dataframe(person_summary, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # 按年度彙整
+            if "申報日期" in df_stat.columns:
+                st.subheader("📅 歷年申報次數")
+                df_stat["年度"] = df_stat["申報日期"].str[:4]
+                year_summary = df_stat.groupby("年度").size().reset_index(name="申報次數").sort_values("年度", ascending=False)
+                st.dataframe(year_summary, use_container_width=True, hide_index=True)
 
     # ── 頁籤3：台股申報說明 ──
     with tab_tw3:
@@ -622,12 +768,11 @@ if is_tw_market:
 
 ### 💡 分析建議
 1. **持股比例高且持續增加**：通常代表董監事對公司前景看好
-2. **排行榜前段**：董監持股比例高，籌碼相對穩定
-3. **個股 vs 排行**：將個股持股比例對照全市場排名，可評估籌碼集中度
+2. **買進筆數 >> 賣出筆數**：籌碼集中信號
+3. **質押比例**：留意財務風險
 
 ### 🔗 延伸查詢
-- [Goodinfo 個股董監持股](https://goodinfo.tw/tw/BasicInfo.asp?STOCK_ID=2330)
-- [Goodinfo 全體董監持股排行](https://goodinfo.tw/tw/StockList.asp?SHEET=%E8%91%A3%E7%9B%A3%E6%8C%81%E8%82%A1)
+- [FinMind 台股資料](https://finmindtrade.com/)
 - [公開資訊觀測站](https://mops.twse.com.tw)
         """)
 

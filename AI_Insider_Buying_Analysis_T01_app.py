@@ -100,44 +100,20 @@ def get_insider_trading_by_cik(cik, api_key):
         return []
 
 # ==================== FinMind API 函數（台股，Backer 付費等級）====================
+# 注意：FinMind 沒有董監事個人申報異動資料集
+# 正確資料來源：公開資訊觀測站（MOPS）的董監事持股異動申報
+# FinMind 提供的是：股東持股分級、外資持股、三大法人等籌碼面資料
 
 FINMIND_BASE_URL = "https://api.finmindtrade.com/api/v4/data"
 
-@st.cache_data(ttl=1800)
-def get_finmind_insider_trading(stock_code, finmind_token, start_date="2020-01-01"):
-    """
-    透過 FinMind API 取得台股董監事持股異動申報
-    dataset: TaiwanStockInsiderTrading（需 Backer 付費等級）
-    """
-    params = {
-        "dataset": "TaiwanStockInsiderTrading",
-        "data_id": stock_code,
-        "start_date": start_date,
-        "token": finmind_token,
-    }
-    try:
-        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("status") != 200:
-            msg = result.get("msg", "未知錯誤")
-            return pd.DataFrame(), f"FinMind API 回傳錯誤：{msg}"
-        data = result.get("data", [])
-        if not data:
-            return pd.DataFrame(), None
-        df = pd.DataFrame(data)
-        return df, None
-    except requests.exceptions.Timeout:
-        return pd.DataFrame(), "請求逾時，請稍後再試"
-    except requests.exceptions.HTTPError as e:
-        return pd.DataFrame(), f"HTTP 錯誤：{e}"
-    except Exception as e:
-        return pd.DataFrame(), str(e)
+def _finmind_headers(token):
+    """FinMind v4 正確驗證方式：Authorization Bearer header"""
+    return {"Authorization": f"Bearer {token}"}
 
 
 @st.cache_data(ttl=1800)
 def get_finmind_stock_price(stock_code, finmind_token):
-    """取得台股最新股價（TaiwanStockPrice，近 5 日）"""
+    """取得台股最新股價（TaiwanStockPrice）"""
     from datetime import timedelta
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -146,10 +122,10 @@ def get_finmind_stock_price(stock_code, finmind_token):
         "data_id": stock_code,
         "start_date": start,
         "end_date": end,
-        "token": finmind_token,
     }
     try:
-        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=15)
+        resp = requests.get(FINMIND_BASE_URL, headers=_finmind_headers(finmind_token),
+                            params=params, timeout=15)
         result = resp.json()
         if result.get("status") != 200:
             return None
@@ -164,36 +140,151 @@ def get_finmind_stock_price(stock_code, finmind_token):
         return None
 
 
-def process_finmind_insider_df(df):
+@st.cache_data(ttl=1800)
+def get_finmind_holding_shares_per(stock_code, finmind_token, start_date="2020-01-01"):
     """
-    整理 FinMind TaiwanStockInsiderTrading DataFrame，
-    統一欄位名稱為中文，方便顯示。
+    股東持股分級表 TaiwanStockHoldingSharesPer（需 Backer 付費等級）
+    顯示各持股區間的股東人數與持股比例，反映籌碼集中度
     """
-    if df.empty:
-        return df
-    col_map = {
-        "date": "申報日期",
-        "stock_id": "股票代號",
-        "name": "內部人姓名",
-        "title": "職位",
-        "change_type": "異動類型",
-        "change_shares": "異動股數",
-        "holding_shares": "持有股數",
-        "holding_ratio": "持股比例(%)",
-        "pledge_shares": "質押股數",
-        "pledge_ratio": "質押比例(%)",
+    params = {
+        "dataset": "TaiwanStockHoldingSharesPer",
+        "data_id": stock_code,
+        "start_date": start_date,
     }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    # 格式化數字欄位
-    for col in ["異動股數", "持有股數", "質押股數"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).apply(lambda x: f"{x:,}")
-    for col in ["持股比例(%)", "質押比例(%)"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-    if "申報日期" in df.columns:
-        df = df.sort_values("申報日期", ascending=False)
-    return df.reset_index(drop=True)
+    try:
+        resp = requests.get(FINMIND_BASE_URL, headers=_finmind_headers(finmind_token),
+                            params=params, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") != 200:
+            msg = result.get("msg", "未知錯誤")
+            return pd.DataFrame(), f"FinMind API 錯誤：{msg}"
+        data = result.get("data", [])
+        if not data:
+            return pd.DataFrame(), None
+        return pd.DataFrame(data), None
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response else "?"
+        msg = ""
+        try:
+            msg = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        return pd.DataFrame(), f"HTTP {status}：{msg or str(e)}"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=1800)
+def get_finmind_institutional_investors(stock_code, finmind_token, start_date="2023-01-01"):
+    """
+    三大法人買賣表 TaiwanStockInstitutionalInvestorsBuySell
+    外資、投信、自營商的買賣超，反映機構持股動向
+    """
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": stock_code,
+        "start_date": start_date,
+    }
+    try:
+        resp = requests.get(FINMIND_BASE_URL, headers=_finmind_headers(finmind_token),
+                            params=params, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") != 200:
+            msg = result.get("msg", "未知錯誤")
+            return pd.DataFrame(), f"FinMind API 錯誤：{msg}"
+        data = result.get("data", [])
+        if not data:
+            return pd.DataFrame(), None
+        return pd.DataFrame(data), None
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response else "?"
+        msg = ""
+        try:
+            msg = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        return pd.DataFrame(), f"HTTP {status}：{msg or str(e)}"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# ==================== MOPS 公開資訊觀測站 — 董監事持股異動申報 ====================
+
+MOPS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/javascript, */*",
+    "Referer": "https://mops.twse.com.tw/",
+}
+
+@st.cache_data(ttl=1800)
+def get_mops_insider_changes(stock_code, year_roc=None):
+    """
+    公開資訊觀測站：董監事持股異動申報
+    API: https://mops.twse.com.tw/mops/web/ajax_t51sb06
+    year_roc: 民國年，預設查當年度
+    回傳 (DataFrame, error_msg)
+    """
+    if year_roc is None:
+        year_roc = datetime.now().year - 1911
+
+    url = "https://mops.twse.com.tw/mops/web/ajax_t51sb06"
+    form_data = {
+        "encodeURIComponent": "1",
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "queryName": "co_id",
+        "inpuType": "co_id",
+        "TYPEK": "all",
+        "isnew": "false",
+        "co_id": stock_code,
+        "year": str(year_roc),
+    }
+    try:
+        resp = requests.post(url, data=form_data, headers=MOPS_HEADERS, timeout=20)
+        resp.encoding = "utf-8"
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"MOPS HTTP {resp.status_code}"
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 找所有表格
+        tables = soup.find_all("table")
+        if not tables:
+            return pd.DataFrame(), "MOPS 無資料（該年度無申報記錄）"
+
+        dfs = []
+        for tbl in tables:
+            try:
+                sub = pd.read_html(str(tbl))
+                for df in sub:
+                    if df.shape[0] > 0 and df.shape[1] >= 4:
+                        dfs.append(df)
+            except Exception:
+                continue
+
+        if not dfs:
+            return pd.DataFrame(), "MOPS 解析失敗（找不到有效資料表）"
+
+        df = pd.concat(dfs, ignore_index=True)
+        # 攤平多層欄位
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join(str(c) for c in col if "Unnamed" not in str(c)).strip()
+                          for col in df.columns]
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.dropna(how="all").reset_index(drop=True)
+        return df, None
+
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "MOPS 請求逾時"
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), "無法連線至 MOPS"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
 
 
 
@@ -541,15 +632,14 @@ with st.sidebar:
     if is_tw_market:
         st.markdown("""
 **基本使用**：
-1. 選擇「台股」市場
-2. 輸入 FinMind API Key（必填）
-3. 輸入台股代號（必填）
-4. 點擊「執行分析」
-5. 查看「董監事持股異動」頁籤
+1. 輸入 FinMind API Key（必填）
+2. 輸入台股代號（必填）
+3. 點擊「執行分析」
 
-**資料來源**：
-- FinMind API（Backer 付費等級）
-- 台股董監事持股異動申報
+**各頁籤資料來源**：
+- 📋 董監事持股異動 → 公開資訊觀測站（免費）
+- 📊 股東持股分級 → FinMind Backer
+- 🏦 三大法人買賣 → FinMind（一般會員可用）
         """)
     else:
         st.markdown("""
@@ -594,10 +684,10 @@ if not run_button:
 - 20 種交易類型完整說明與價值評級
 - 提供 SEC 官方文件連結
 
-### 🇹🇼 台股（FinMind API）
-- 透過 FinMind Backer 付費 API 查詢董監事持股異動申報
-- 支援按異動類型篩選與歷年統計分析
-- 需要 FinMind API Key（Backer 付費等級）
+### 🇹🇼 台股（混合資料來源）
+- 📋 **董監事持股異動**：公開資訊觀測站（MOPS）免費資料，按民國年度查詢
+- 📊 **股東持股分級**：FinMind `TaiwanStockHoldingSharesPer`（Backer）
+- 🏦 **三大法人買賣**：FinMind `TaiwanStockInstitutionalInvestorsBuySell`
 
 ### 📋 共同功能
 - 完整交易明細顯示
@@ -619,8 +709,10 @@ if is_tw_market:
         st.markdown("""
 > **如何取得 FinMind API Key？**
 > 1. 前往 [FinMind](https://finmindtrade.com/) 註冊帳號
-> 2. 升級至 **Backer** 付費等級（可解鎖 TaiwanStockInsiderTrading 資料集）
+> 2. 升級至 **Backer** 付費等級（可解鎖股東持股分級等資料集）
 > 3. 至帳號設定頁面複製 Token，貼入左側輸入框
+>
+> **注意：** 董監事持股異動（MOPS）頁籤不需要 FinMind，輸入任意值即可
         """)
         st.stop()
 
@@ -647,100 +739,139 @@ if is_tw_market:
     st.markdown("---")
 
     # 台股頁籤
-    tab_tw1, tab_tw2, tab_tw3 = st.tabs([
+    tab_tw1, tab_tw2, tab_tw3, tab_tw4 = st.tabs([
         "📋 董監事持股異動",
-        "📊 異動統計分析",
+        "📊 股東持股分級（籌碼）",
+        "🏦 三大法人買賣",
         "📚 台股申報說明"
     ])
 
-    # ── 頁籤1：董監事持股異動（FinMind）──
+    # ── 頁籤1：董監事持股異動（MOPS 公開資訊觀測站）──
     with tab_tw1:
         st.subheader(f"📋 {symbol_input} 董監事持股異動申報")
-        st.caption("資料來源：FinMind API — TaiwanStockInsiderTrading（Backer 付費等級）")
+        st.caption("資料來源：公開資訊觀測站（MOPS）— 董監事持股異動申報表（t51sb06）")
 
-        # 日期範圍選擇
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            start_year = st.selectbox("查詢起始年份", options=[str(y) for y in range(2020, datetime.now().year + 1)], index=0)
-        start_date_str = f"{start_year}-01-01"
+        col_y1, col_y2 = st.columns(2)
+        with col_y1:
+            current_roc = datetime.now().year - 1911
+            year_options = list(range(current_roc, current_roc - 6, -1))
+            chosen_roc = st.selectbox("查詢民國年度", options=year_options,
+                                      format_func=lambda y: f"民國 {y} 年（{y+1911}）")
+        with col_y2:
+            st.markdown("")
+            st.markdown("")
+            st.caption(f"💡 MOPS 依年度申報，每次查一個年度")
 
-        with st.spinner(f"正在從 FinMind 取得 {symbol_input} 董監事持股異動資料..."):
-            df_insider_raw, insider_err = get_finmind_insider_trading(symbol_input, finmind_api_key, start_date=start_date_str)
+        with st.spinner(f"正在從公開資訊觀測站取得 {symbol_input} 民國 {chosen_roc} 年資料..."):
+            df_mops, mops_err = get_mops_insider_changes(symbol_input, year_roc=chosen_roc)
 
-        if insider_err:
-            st.error(f"❌ 取得資料失敗：{insider_err}")
-            st.info("請確認：\n1. FinMind API Key 是否正確\n2. 帳號是否為 Backer 付費等級\n3. 股票代號是否正確（例如台積電：**2330**）")
-        elif df_insider_raw.empty:
-            st.warning(f"⚠️ {symbol_input} 在 {start_year} 年後無董監事持股異動申報記錄")
+        if mops_err:
+            st.error(f"❌ {mops_err}")
+            st.info(f"📎 可直接至 [公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06) 查詢")
+        elif df_mops.empty:
+            st.warning(f"⚠️ 民國 {chosen_roc} 年無 {symbol_input} 的董監事持股異動申報記錄")
         else:
-            df_display = process_finmind_insider_df(df_insider_raw.copy())
-            st.info(f"共 {len(df_display)} 筆異動申報記錄（{start_year} 年起）")
-
-            # 篩選異動類型
-            if "異動類型" in df_display.columns:
-                all_types = ["全部"] + sorted(df_display["異動類型"].dropna().unique().tolist())
-                chosen_type = st.selectbox("篩選異動類型", options=all_types)
-                if chosen_type != "全部":
-                    df_display = df_display[df_display["異動類型"] == chosen_type]
-
-            st.dataframe(df_display, use_container_width=True, height=500, hide_index=True)
+            st.info(f"共 {len(df_mops)} 筆申報記錄")
+            st.dataframe(df_mops, use_container_width=True, height=500, hide_index=True)
             st.markdown("---")
-            csv1 = df_display.to_csv(index=False).encode("utf-8-sig")
+            csv1 = df_mops.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 下載董監事持股異動 CSV", csv1,
-                file_name=f"tw_insider_{symbol_input}_{datetime.now().strftime('%Y%m%d')}.csv",
+                file_name=f"mops_insider_{symbol_input}_{chosen_roc}.csv",
+                mime="text/csv"
+            )
+            st.markdown(f"🔗 [至公開資訊觀測站查看原始資料](https://mops.twse.com.tw/mops/web/t51sb06)")
+
+    # ── 頁籤2：股東持股分級（FinMind Backer）──
+    with tab_tw2:
+        st.subheader(f"📊 {symbol_input} 股東持股分級（籌碼集中度）")
+        st.caption("資料來源：FinMind API — TaiwanStockHoldingSharesPer（需 Backer 付費等級）")
+
+        start_year2 = st.selectbox("查詢起始年份", options=[str(y) for y in range(2020, datetime.now().year + 1)], index=0, key="chip_year")
+
+        with st.spinner(f"正在從 FinMind 取得 {symbol_input} 股東持股分級..."):
+            df_holding, holding_err = get_finmind_holding_shares_per(symbol_input, finmind_api_key, start_date=f"{start_year2}-01-01")
+
+        if holding_err:
+            st.error(f"❌ {holding_err}")
+            st.info("請確認 FinMind API Key 正確且為 Backer 付費等級")
+        elif df_holding.empty:
+            st.warning("⚠️ 無股東持股分級資料")
+        else:
+            # 取最新一期
+            if "date" in df_holding.columns:
+                latest_date = df_holding["date"].max()
+                df_latest = df_holding[df_holding["date"] == latest_date].copy()
+                st.info(f"最新資料日期：{latest_date}　共 {len(df_holding)} 筆歷史記錄")
+
+                col_map_h = {
+                    "date": "日期", "stock_id": "股票代號",
+                    "HoldingSharesLevel": "持股區間", "people": "股東人數",
+                    "percent": "持股比例(%)", "unit": "持股張數"
+                }
+                df_latest = df_latest.rename(columns={k: v for k, v in col_map_h.items() if k in df_latest.columns})
+                st.subheader(f"最新期（{latest_date}）持股分佈")
+                st.dataframe(df_latest, use_container_width=True, height=400, hide_index=True)
+            else:
+                st.dataframe(df_holding, use_container_width=True, height=400, hide_index=True)
+
+            st.markdown("---")
+            csv2 = df_holding.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下載股東持股分級 CSV", csv2,
+                file_name=f"holding_per_{symbol_input}_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
 
-    # ── 頁籤2：統計分析 ──
-    with tab_tw2:
-        st.subheader(f"📊 {symbol_input} 異動統計分析")
+    # ── 頁籤3：三大法人買賣（FinMind）──
+    with tab_tw3:
+        st.subheader(f"🏦 {symbol_input} 三大法人買賣超")
+        st.caption("資料來源：FinMind API — TaiwanStockInstitutionalInvestorsBuySell")
 
-        with st.spinner("正在載入統計資料..."):
-            df_stat_raw, stat_err = get_finmind_insider_trading(symbol_input, finmind_api_key, start_date="2020-01-01")
+        start_year3 = st.selectbox("查詢起始年份", options=[str(y) for y in range(2022, datetime.now().year + 1)], index=0, key="inst_year")
 
-        if stat_err or df_stat_raw.empty:
-            st.warning("⚠️ 無法取得統計資料，請先確認頁籤一資料正常")
+        with st.spinner(f"正在從 FinMind 取得 {symbol_input} 三大法人資料..."):
+            df_inst, inst_err = get_finmind_institutional_investors(symbol_input, finmind_api_key, start_date=f"{start_year3}-01-01")
+
+        if inst_err:
+            st.error(f"❌ {inst_err}")
+        elif df_inst.empty:
+            st.warning("⚠️ 無三大法人資料")
         else:
-            df_stat = process_finmind_insider_df(df_stat_raw.copy())
+            col_map_i = {
+                "date": "日期", "stock_id": "股票代號", "name": "法人類別",
+                "buy": "買進(張)", "sell": "賣出(張)"
+            }
+            df_inst = df_inst.rename(columns={k: v for k, v in col_map_i.items() if k in df_inst.columns})
+            if "買進(張)" in df_inst.columns and "賣出(張)" in df_inst.columns:
+                df_inst["買賣超(張)"] = pd.to_numeric(df_inst["買進(張)"], errors="coerce") - pd.to_numeric(df_inst["賣出(張)"], errors="coerce")
+            if "日期" in df_inst.columns:
+                df_inst = df_inst.sort_values("日期", ascending=False)
+
+            st.info(f"共 {len(df_inst)} 筆記錄（{start_year3} 年起）")
 
             # 統計卡片
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("總申報筆數", f"{len(df_stat)} 筆")
-            with col2:
-                if "異動類型" in df_stat.columns:
-                    buy_cnt = df_stat["異動類型"].str.contains("買|增|認購", na=False).sum()
-                    st.metric("買進/增持", f"{buy_cnt} 筆")
-            with col3:
-                if "異動類型" in df_stat.columns:
-                    sell_cnt = df_stat["異動類型"].str.contains("賣|減|轉讓", na=False).sum()
-                    st.metric("賣出/減持", f"{sell_cnt} 筆")
-            with col4:
-                if "內部人姓名" in df_stat.columns:
-                    unique_persons = df_stat["內部人姓名"].nunique()
-                    st.metric("申報人數", f"{unique_persons} 人")
+            if "法人類別" in df_inst.columns and "買賣超(張)" in df_inst.columns:
+                col1, col2, col3 = st.columns(3)
+                for col_w, investor_name in zip([col1, col2, col3], ["外資", "投信", "自營商"]):
+                    sub = df_inst[df_inst["法人類別"].str.contains(investor_name, na=False)]
+                    total_net = pd.to_numeric(sub["買賣超(張)"], errors="coerce").sum()
+                    with col_w:
+                        st.metric(f"{investor_name} 累計買賣超", f"{int(total_net):,} 張",
+                                  delta=f"{'↑' if total_net > 0 else '↓'} {abs(int(total_net)):,}")
+                st.markdown("---")
 
+            st.dataframe(df_inst, use_container_width=True, height=450, hide_index=True)
             st.markdown("---")
+            csv3 = df_inst.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下載三大法人買賣 CSV", csv3,
+                file_name=f"institutional_{symbol_input}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
-            # 按人別彙整
-            if "內部人姓名" in df_stat.columns and "異動類型" in df_stat.columns:
-                st.subheader("👥 各董監事申報次數彙整")
-                person_summary = df_stat.groupby(["內部人姓名", "職位"] if "職位" in df_stat.columns else ["內部人姓名"]).size().reset_index(name="申報次數")
-                person_summary = person_summary.sort_values("申報次數", ascending=False)
-                st.dataframe(person_summary, use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-
-            # 按年度彙整
-            if "申報日期" in df_stat.columns:
-                st.subheader("📅 歷年申報次數")
-                df_stat["年度"] = df_stat["申報日期"].str[:4]
-                year_summary = df_stat.groupby("年度").size().reset_index(name="申報次數").sort_values("年度", ascending=False)
-                st.dataframe(year_summary, use_container_width=True, hide_index=True)
-
-    # ── 頁籤3：台股申報說明 ──
-    with tab_tw3:
+    # ── 頁籤4：台股申報說明 ──
+    with tab_tw4:
         st.subheader("📚 台股董監事持股申報說明")
 
         st.markdown("""

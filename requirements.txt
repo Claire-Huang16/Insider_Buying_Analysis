@@ -4,3 +4,4 @@ pandas
 plotly
 openai
 numpy
+beautifulsoup4
